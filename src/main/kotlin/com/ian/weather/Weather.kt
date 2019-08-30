@@ -2,15 +2,19 @@ package com.ian.weather
 
 
 import arrow.Kind
-import arrow.core.Either
-import arrow.core.Option
-import arrow.core.left
-import arrow.core.right
+import arrow.core.*
+import arrow.core.extensions.either.foldable.foldRight
+import arrow.data.extensions.list.semigroupK.combineK
 import arrow.effects.rx2.MaybeK
 import arrow.effects.rx2.extensions.maybek.async.async
 import arrow.effects.rx2.fix
 import arrow.effects.typeclasses.Async
+import arrow.optics.optics
 import arrow.typeclasses.ApplicativeError
+
+import khttp.get
+import khttp.responses.Response
+import org.json.JSONObject
 
 
 //https://forecast.weather.gov/MapClick.php?lat=40.73114000000004&lon=-73.98882999999995
@@ -34,14 +38,15 @@ import arrow.typeclasses.ApplicativeError
 //    "detailedForecast": ""
 //}]
 
-data class Period (val temperature: Int)
-data class Property (val periods: List<Period>)
-data class JSON (val properties: Property)
+
 
 sealed class PointLookupError : RuntimeException() // assuming you are using exceptions
 data class PointNotInLocalStorage(val point: Point) : PointLookupError()
 data class PointNotInRemoteStorage(val point: Point) : PointLookupError()
 data class UnknownError(val underlying: Throwable) : PointLookupError()
+
+sealed class NetworkError : RuntimeException()
+data class FailedFetch(val url: String) : NetworkError()
 
 data class Point (val x: Int, val y: Int)
 
@@ -50,6 +55,30 @@ data class Forecast (val temp: Int)
 interface DataSource<F> {
     fun forecastByPoint(point: Point): Kind<F, List<Forecast>>
 }
+
+object Marshall {
+    fun <T>convertToJson(m: T, ev: JsonMarshaller<T>): JsonElement = ev.run { m.toJson() }
+
+    interface JsonMarshaller<T> {
+        fun T.toJson(): JsonElement
+
+        companion object {}
+    }
+}
+
+object Unmarshaller {
+    fun <T>convertFromJson(j: String, ev: JsonMarshaller<T>): Either<Exception, T> = ev.run { fromJson(j) }
+
+    interface JsonMarshaller<T> {
+        fun fromJson(j: String): Either<Exception, T>
+
+        companion object {}
+    }
+}
+
+data class Period (val temperature: Int)
+data class Property (val periods: List<Period>)
+data class HourlyForecast (val properties: Property)
 
 class LocalDataSource<F>(A: ApplicativeError<F, Throwable>) :
         DataSource<F>, ApplicativeError<F, Throwable> by A {
@@ -66,6 +95,30 @@ class LocalDataSource<F>(A: ApplicativeError<F, Throwable>) :
 
 class RemoteDataSource<F>(A: Async<F>): DataSource<F>, Async<F> by A {
 
+    private fun fetch(): Either<Throwable, Response> =
+        try {
+            Right(get("https://api.weather.gov/gridpoints/TOP/31,80/forecast/hourly"))
+        } catch (e: Exception) {
+            Left(FailedFetch(""))
+        }
+
+    private fun getPoints(json: JSONObject): List<Forecast> =
+        // this is bad, should be autoparsed and an Either
+        json.getJSONObject("properties")
+            .getJSONArray("periods")
+            .fold(listOf(), { acc, ob: Any ->
+                acc.combineK(listOf(Forecast((ob as JSONObject).get("temperature") as Int)))
+            })
+
+    private fun remoteSource(): Either<Throwable, List<Forecast>> =
+        fetch().fold(
+                { it.left() },
+                { val p = getPoints(it.jsonObject)
+                  print(p)
+                  p.right()
+                }
+        )
+
     // TODO: use reader monad to get the request library
     private val internetSource: Map<Point, List<Forecast>> =
             mapOf(Point(10, 10) to listOf(Forecast(50 )))
@@ -73,7 +126,7 @@ class RemoteDataSource<F>(A: Async<F>): DataSource<F>, Async<F> by A {
     override fun forecastByPoint(point: Point): Kind<F, List<Forecast>> =
         async {
             callback: (Either<Throwable, List<Forecast>>) -> Unit ->
-                Option.fromNullable(internetSource[point]).fold(
+                remoteSource().fold(
                         { callback(PointNotInRemoteStorage(point).left()) },
                         { callback(it.right())}
                 )
@@ -119,4 +172,5 @@ object test {
             repository.forecastByPoint(point2).fix().maybe.subscribe({ println(it) }, { println(it) })
         }
     }
+
 }
